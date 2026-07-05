@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <time.h>
 
 // --- MAPEO DE PINES COMPARTIDOS (TOUCH Y VIDEO) ---
 #define YP 12  // LCD_WR
@@ -12,6 +14,14 @@
 #define PIN_ACS  35
 
 TFT_eSPI tft = TFT_eSPI();
+
+// --- CONFIGURACIÓN WI-FI Y NTP ---
+const char* ssid       = "Cotecal_LOJO-2g"; // Reemplaza con tu Wi-Fi
+const char* password   = "0229043397";    // Reemplaza con tu contraseña
+const char* ntpServer  = "pool.ntp.org";
+const long  gmtOffset_sec = -10800;          // UTC-3 para Argentina
+const int   daylightOffset_sec = 0;          // Sin horario de verano
+int lastMinute = -1;                         // Control para no redibujar el reloj en cada loop
 
 // --- COLORES EXCLUSIVOS DEL SCADA (Conversión de CSS Hex a RGB565) ---
 #define COLOR_BG        tft.color565(238, 242, 246) // #eef2f6 Fondo general
@@ -63,6 +73,30 @@ void goTo(Screen newScreen) {
     refreshNeeded = true;
 }
 
+void updateClock() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        return; // Si no se ha sincronizado la hora aún, no dibuja nada
+    }
+
+    // Solo redibuja si cambió el minuto o si forzamos el refresco completo (cambio de pantalla)
+    if (timeinfo.tm_min != lastMinute || refreshNeeded) {
+        char dateTimeStr[20];
+        // %d/%m/%y genera dia/mes/año en 2 dígitos (ej: 05/07/26) y %H:%M la hora
+        strftime(dateTimeStr, sizeof(dateTimeStr), "%d/%m/%y %H:%M", &timeinfo); 
+
+        // Limpiar el espacio de la esquina superior derecha (ahora más ancho para la fecha + hora)
+        tft.fillRect(190, 0, 130, 20, COLOR_TOPBAR);
+        
+        tft.setTextColor(COLOR_TEXT_DARK);
+        tft.setTextFont(2);
+        tft.setCursor(195, 2);
+        tft.print(dateTimeStr);
+
+        lastMinute = timeinfo.tm_min;
+    }
+}
+
 void drawTopBar(const char* titulo) {
     tft.fillRect(0, 0, 320, 20, COLOR_TOPBAR);
     tft.drawFastHLine(0, 20, 320, COLOR_BORDER);
@@ -71,13 +105,11 @@ void drawTopBar(const char* titulo) {
     tft.setCursor(8, 2);
     tft.print(titulo);
     
-    // Punto parpadeante de "Live"
-    static bool dotOn = true;
-    tft.fillCircle(250, 10, 3, dotOn ? COLOR_GREEN : COLOR_TOPBAR);
-    dotOn = !dotOn;
-    
-    tft.setCursor(265, 2);
-    tft.print("13.2V"); 
+    // Forzamos el redibujado del reloj al cambiar de pantalla
+    int tempMinute = lastMinute; 
+    lastMinute = -1; 
+    updateClock();
+    lastMinute = tempMinute; // Restauramos para que el loop siga su curso normal
 }
 
 void drawBackButton() {
@@ -211,7 +243,6 @@ void renderKwScreen() {
             tft.drawString(labels[b], kwBoxes[b] + 5, 183, 1);
         }
 
-        // 4. Botón corregido con el texto solicitado: "CONSUMO MENSUAL" y coordenadas X centradas
         tft.fillRoundRect(10, 217, 300, 19, 4, COLOR_WHITE);
         tft.drawRoundRect(10, 217, 300, 19, 4, COLOR_BORDER);
         tft.setTextColor(COLOR_GREEN);
@@ -318,15 +349,10 @@ void comprobarTouch() {
                 }
             } 
             else { 
-                // Botón VOLVER (Ajustado estricto hasta PY=90 según los datos de tu lápiz)
                 if (px >= 0 && px <= 95 && py >= 0 && py <= 90) {
                     if (currentScreen == SCREEN_MONTHLY) goTo(SCREEN_KW);
                     else goTo(SCREEN_HOME);
                 }
-                
-                // LÓGICA CORREGIDA PARA EL BOTÓN CONSUMO MENSUAL (SCREEN_KW)
-                // Gracias a tu log de telemetría, sabemos que con lápiz el botón entrega entre PY:109 y PY:211.
-                // Cualquier toque por debajo de la línea virtual PY:90 activará el menú de forma hiper-eficiente.
                 else if (currentScreen == SCREEN_KW && py > 90) {
                     goTo(SCREEN_MONTHLY);
                 }
@@ -341,6 +367,42 @@ void comprobarTouch() {
 
 void setup() {
     Serial.begin(115200);
+    
+    // --- INICIO WI-FI ---
+    Serial.print("Conectando a Wi-Fi");
+    WiFi.begin(ssid, password);
+    
+    // Timeout de 10 segundos para no colgar el SCADA si el Wi-Fi falla
+    int timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+        delay(500);
+        Serial.print(".");
+        timeout++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println(" ¡Conectado!");
+        
+        // --- CONFIGURACIÓN NTP ---
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        
+        // Esperamos un instante a que el chip tome la hora real de la red
+        struct tm timeinfo;
+        int retry = 0;
+        while(!getLocalTime(&timeinfo) && retry < 10) {
+            delay(500);
+            retry++;
+        }
+        Serial.println("Hora y fecha sincronizadas exitosamente.");
+        
+        // --- APAGAMOS EL WI-FI PARA LIBERAR EL ADC2 (Y QUE ANDE EL TOUCH) ---
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        Serial.println("Wi-Fi apagado. Pines ADC2 liberados para el Touch.");
+    } else {
+        Serial.println("\nNo se pudo conectar al Wi-Fi. Iniciando sin hora.");
+    }
+
     analogSetWidth(12);
 
     for(int i=0; i<72; i++) kwHist[i] = 0.9;
@@ -352,6 +414,8 @@ void setup() {
 }
 
 void loop() {
+    updateClock(); // Mantiene el reloj y la fecha actualizados usando el RTC interno sin bloquear
+
     if (millis() - ultimoTiempoSensores > 500) {
         ultimoTiempoSensores = millis();
         int maxV = 0, minV = 4095;
